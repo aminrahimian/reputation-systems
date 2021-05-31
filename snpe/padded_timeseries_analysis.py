@@ -1,12 +1,14 @@
 import multiprocessing as mp
 
+from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import arviz
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyreadr
 import sbi
 import sbi.utils as sbi_utils
 import seaborn as sns
@@ -23,12 +25,12 @@ from snpe.utils.tqdm_utils import tqdm_joblib
 from tqdm import tqdm
 
 # Set plotting parameters
-sns.set(style="white", context="talk", font_scale=3.5)
+sns.set(style="white", context="talk", font_scale=2.5)
 sns.set_color_codes(palette="colorblind")
 sns.set_style("ticks", {"axes.linewidth": 2.0})
 plt.ion()
 
-ARTIFACT_PATH = Path("./artifacts/ICWSM")
+ARTIFACT_PATH = Path("./artifacts/hyperparameter_tuning/cnn_tuning")
 
 
 def generate_and_save_simulations(
@@ -40,32 +42,42 @@ def generate_and_save_simulations(
     simulator.save_simulations(ARTIFACT_PATH)
 
 
-def infer_and_save_posterior(device: str, simulator_type: str, simulation_type: str) -> None:
+def infer_and_save_posterior(device: str, simulator_type: str, simulation_type: str, params: Dict) -> None:
     parameter_prior = sbi_utils.BoxUniform(
         low=torch.tensor([0.0, 0.0]).type(torch.FloatTensor), high=torch.tensor([4.0, 4.0]).type(torch.FloatTensor)
     )
-    inferrer = inference_class.HistogramInference(parameter_prior=parameter_prior, device=device)
+    inferrer = inference_class.TimeSeriesInference(parameter_prior=parameter_prior, device=device)
     inferrer.load_simulator(dirname=ARTIFACT_PATH, simulator_type=simulator_type, simulation_type=simulation_type)
-    inferrer.infer_snpe_posterior()
+    batch_size = params.pop("batch_size")
+    learning_rate = params.pop("learning_rate")
+    hidden_features = params.pop("hidden_features")
+    num_transforms = params.pop("num_transforms")
+    inferrer.infer_snpe_posterior(
+        embedding_net_conf=params,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        hidden_features=hidden_features,
+        num_transforms=num_transforms,
+    )
     inferrer.save_inference(ARTIFACT_PATH)
 
 
 def sample_posterior_with_observed(
-    observed_histograms: np.array, num_samples: int, simulator_type: str, simulation_type: str
+    observations: np.array, num_samples: int, simulator_type: str, simulation_type: str
 ) -> np.array:
     # The parameter prior doesn't matter here as it will be overridden by that of the loaded inference object
     parameter_prior = sbi.utils.BoxUniform(
         low=torch.tensor([0.0, 0.0]).type(torch.FloatTensor), high=torch.tensor([4.0, 4.0]).type(torch.FloatTensor)
     )
-    inferrer = inference_class.HistogramInference(parameter_prior=parameter_prior)
+    inferrer = inference_class.TimeSeriesInference(parameter_prior=parameter_prior)
     inferrer.load_simulator(dirname=ARTIFACT_PATH, simulator_type=simulator_type, simulation_type=simulation_type)
     inferrer.load_inference(dirname=ARTIFACT_PATH)
-    posterior_samples = inferrer.get_posterior_samples(observed_histograms, num_samples=num_samples)
+    posterior_samples = inferrer.get_posterior_samples(observations, num_samples=num_samples)
     return posterior_samples
 
 
 def plot_simulated_histogram_variety_test(parameters: np.array) -> None:
-    params = {"review_prior": np.ones(5), "tendency_to_rate": 0.05}
+    params = {"review_prior": np.ones(5), "tendency_to_rate": 0.05, "simulation_type": "histogram"}
     simulator = simulator_class.DoubleRhoSimulator(params)
     simulator.simulation_parameters = {"rho": parameters}
 
@@ -166,7 +178,7 @@ def plot_test_parameter_recovery(
     parameter_prior = sbi.utils.BoxUniform(
         low=torch.tensor([0.0, 0.0]).type(torch.FloatTensor), high=torch.tensor([4.0, 4.0]).type(torch.FloatTensor)
     )
-    inferrer = inference_class.HistogramInference(parameter_prior=parameter_prior)
+    inferrer = inference_class.TimeSeriesInference(parameter_prior=parameter_prior)
     inferrer.load_simulator(dirname=ARTIFACT_PATH, simulator_type=simulator_type, simulation_type=simulation_type)
     inferrer.load_inference(dirname=ARTIFACT_PATH)
     posterior_samples = inferrer.get_posterior_samples(simulations, num_samples=num_posterior_samples)
@@ -274,8 +286,10 @@ def plot_test_parameter_recovery(
         plt.hist(rho_1_probs, alpha=0.5, label=r"$\rho_{+}$")
         plt.legend()
         plt.title(
-            f"Posterior probability placed by inference engine in a band of {2*param_posterior_prob_band}"
-            + f"\n around the true value of the parameters ({parameters.shape[0]} trials)",
+            f"""
+            Posterior probability placed by inference engine in a band of {2*param_posterior_prob_band} \n
+            around the true value of the parameters ({parameters.shape[0]} trials)
+            """,
             fontsize=24.0,
         )
 
@@ -328,46 +342,72 @@ def stats_mean_rho_binary_features(features: pd.DataFrame, features_to_test: lis
 
 
 def main() -> None:
-    torch.set_num_threads(16)
+    torch.set_num_threads(8)
     torch.get_num_threads()
 
     # Simulate, infer posterior and save everything in the artifact directory
-    generate_and_save_simulations(20_000, np.ones(5), 0.05, "histogram")
-    infer_and_save_posterior("gpu", "double_rho", "histogram")
+    generate_and_save_simulations(20_000, np.ones(5), 0.05, "timeseries")
+    inference_params = {
+        "batch_size": 128,
+        "learning_rate": 1.25e-3,
+        "hidden_features": 50,
+        "num_transforms": 5,
+        "num_conv_layers": 3,
+        "num_channels": 7,
+        "conv_kernel_size": 3,
+        "maxpool_kernel_size": 5,
+        "num_dense_layers": 2,
+    }
+    infer_and_save_posterior("gpu", "double_rho", "timeseries", inference_params)
 
-    # Load up the observed data of review histograms and product features
-    ratings = pd.read_csv(ARTIFACT_PATH / "rating_hist_speakers_snpe.txt", sep="\t")
-    features = pd.read_csv(ARTIFACT_PATH / "prod_price_brand_snpe.txt", sep="\t")
+    # Load up the observed data of review timeseries and product features
+    speakers_timeseries = pyreadr.read_r("./artifacts/hyperparameter_tuning/cnn_tuning/rating_speakers_SNPE.Rds")
+    speakers_timeseries = speakers_timeseries[None]
+    speakers_features = pd.read_csv(ARTIFACT_PATH / "speakers_prod_price_brand_snpe.txt", sep="\t")
     # Both loaded dataframes should have the same number of products
-    assert len(ratings) == len(
-        features
-    ), f"Loaded ratings df has shape {ratings.shape} while features has shape {features.shape}"
+    assert speakers_timeseries.asin.unique().shape[0] == len(
+        speakers_features
+    ), f"""
+    Loaded timeseries df has {speakers_timeseries.asin.unique().shape[0]} products
+    while features has shape {speakers_features.shape}
+    """
 
-    # Align the ratings and features DFs to have the same order of products
-    features = features.set_index("asin")
-    features = features.reindex(index=ratings["asin"])
-    features = features.reset_index()
-    assert np.all(
-        features["asin"] == ratings["asin"]
-    ), f"Features and ratings DFs do not have the same ordering of products"
+    # Check that both DFs are sorted properly
+    pd.testing.assert_frame_equal(speakers_timeseries, speakers_timeseries.sort_values(["asin", "unixReviewTime"]))
+    pd.testing.assert_frame_equal(speakers_features, speakers_features.sort_values("asin"))
+
+    # Pull out the ratings from the timeseries DF and convert them into a format
+    # that can be fed into the inference engine
+    timeseries_data = []
+    for product in speakers_features.asin:
+        # We only simulate upto 5001 reviews, so we cut off all observed timeseries at that number as well
+        timeseries = deque([np.zeros(5)], maxlen=5001)
+        ratings = np.array(speakers_timeseries.loc[speakers_timeseries.asin == product, "overall"])
+        ratings = ratings[:5000]
+        for rating in ratings:
+            current_histogram = timeseries[-1].copy()
+            current_histogram[int(rating - 1)] += 1
+            timeseries.append(current_histogram)
+        timeseries_data.append(np.array(timeseries))
+    timeseries_data = np.array(timeseries_data, dtype="object")
+
+    # Get samples from the posteriors
+    posterior_samples = sample_posterior_with_observed(timeseries_data, 10_000, "double_rho", "timeseries")
 
     # Add additional features
-    features["num_reviews"] = np.array(ratings.iloc[:, 1:]).sum(axis=1)
-    features["log_num_reviews"] = np.log(features["num_reviews"] + 1)
-    features["log_val"] = np.log(features["val"] + 1)
-    features["top_10"] = features["brand"].isin(np.array(features["brand"].value_counts()[:10].index))
-    features["top_10"] = ["Y" if i else "N" for i in features["top_10"]]
-
-    # Get samples from the posteriors of all products, using their observed review histograms
-    observed_histograms = np.array(ratings.iloc[:, 1:], dtype=np.float64)
-    posterior_samples = sample_posterior_with_observed(observed_histograms, 10_000, "double_rho", "histogram")
+    num_reviews = []
+    for product in speakers_features.asin:
+        num_reviews.append(np.sum(speakers_timeseries.asin == product))
+    speakers_features["num_reviews"] = np.array(num_reviews)
+    speakers_features["log_num_reviews"] = np.log(speakers_features["num_reviews"] + 1)
+    speakers_features["log_val"] = np.log(speakers_features["val"] + 1)
 
     # Produce histogram plots to test that model can generate all sorts of review distributions
     plot_simulated_histogram_variety_test(np.array([[0.0, 0.0], [1.5, 3.5], [1.0, 1.0], [3.5, 1.5]]))
 
     # Check parameter recovery by model for a handful of parameter values
     recovered_posterior = plot_test_parameter_recovery(
-        np.array([[3.5, 1.0], [1.0, 1.0], [1.5, 2.5]]), 10_000, "double_rho", "histogram", plot_posteriors=True
+        np.array([[3.5, 1.0], [1.0, 1.0], [1.5, 2.5]]), 10_000, "double_rho", "timeseries", plot_posteriors=True
     )
     # Do the same for a larger number of parameter values, but this time don't plot the posteriors
     parameters = np.vstack((np.random.random(size=1000) * 4, np.random.random(size=1000) * 4)).T
@@ -375,15 +415,21 @@ def main() -> None:
         parameters,
         10_000,
         "double_rho",
-        "histogram",
+        "timeseries",
         plot_posteriors=False,
         get_stats=True,
         param_posterior_prob_band=0.5,
     )
 
-    # Compare simulated and observed histograms for a subset of products
+    # To do posterior predictive checks on histograms, first get histograms from timeseries data
+    histogram_data = np.array([ts[-1] for ts in timeseries_data])
+    assert (
+        histogram_data.shape[1] == 5
+    ), f"Should have shape 5 on axis 1 of histograms, got shape {histogram_data.shape} instead"
+
+    # Plot posterior predictive simulated histograms for a subset of products
     simulated_histograms = plot_simulated_vs_actual_histogram_test(
-        observed_histograms,
+        histogram_data,
         posterior_samples[::500, :, :],
         products_to_test=np.array([1, 7, 11, 500]),
         plot_histograms=True,
@@ -391,33 +437,42 @@ def main() -> None:
     )
     # Get simulated histograms for all products
     simulated_histograms = plot_simulated_vs_actual_histogram_test(
-        observed_histograms,
+        histogram_data,
         posterior_samples[::500, :, :],
-        products_to_test=np.arange(observed_histograms.shape[0]),
+        products_to_test=np.arange(histogram_data.shape[0]),
         return_raw_simulations=False,
     )
-    # simulated_histograms = raw_simulations.reshape((-1, observed_histograms.shape[0], 5), order="F")
-    # simulated_histograms /= np.sum(simulated_histograms, axis=-1)[:, :, None]
     np.save(ARTIFACT_PATH / "posterior_predictive_simulations.npy", simulated_histograms)
     # Then get the correlations of the mean and HPD limits of the simulated histograms with the observed
     # aka posterior predictive check (PPC)
-    ppc_corr = review_histogram_correlation(observed_histograms, simulated_histograms)
+    ppc_corr = review_histogram_correlation(histogram_data, simulated_histograms)
     np.save(ARTIFACT_PATH / "ppc_correlations.npy", ppc_corr)
 
     # Add mean and sd of rho to the features DF
-    features["rho_0"] = np.mean(posterior_samples[:, :, 0], axis=0)
-    features["rho_1"] = np.mean(posterior_samples[:, :, 1], axis=0)
-    features["sd_rho_0"] = np.std(posterior_samples[:, :, 0], axis=0)
-    features["sd_rho_1"] = np.std(posterior_samples[:, :, 1], axis=0)
+    speakers_features["rho_0"] = np.mean(posterior_samples[:, :, 0], axis=0)
+    speakers_features["rho_1"] = np.mean(posterior_samples[:, :, 1], axis=0)
+    speakers_features["sd_rho_0"] = np.std(posterior_samples[:, :, 0], axis=0)
+    speakers_features["sd_rho_1"] = np.std(posterior_samples[:, :, 1], axis=0)
     # Now plot rho vs these features
-    plot_mean_rho_vs_features(features, {"log_val": "log(Price in $)", "log_num_reviews": "log(Number of reviews)"})
+    plot_mean_rho_vs_features(
+        speakers_features, {"log_val": "log(Price in $)", "log_num_reviews": "log(Number of reviews)"}
+    )
 
     # Create 2 binary features: above/below mean(log_price) and Y/N top_10 brand product
-    features["top_10"] = features["brand"].isin(np.array(features["brand"].value_counts()[:10].index))
-    features["top_10"] = ["Y" if i else "N" for i in features["top_10"]]
-    features["log_price_above_mean"] = ["Y" if i >= np.mean(features["log_val"]) else "N" for i in features["log_val"]]
+    speakers_features["top_10"] = speakers_features["brand"].isin(
+        np.array(speakers_features["brand"].value_counts()[:10].index)
+    )
+    speakers_features["top_10"] = ["Y" if i else "N" for i in speakers_features["top_10"]]
+    speakers_features["log_price_above_mean"] = [
+        "Y" if i >= np.mean(speakers_features["log_val"]) else "N" for i in speakers_features["log_val"]
+    ]
     # Run statistics on these binary features
-    stats_mean_rho_binary_features(features, ["top_10", "log_price_above_mean"])
+    stats_mean_rho_binary_features(speakers_features, ["top_10", "log_price_above_mean"])
+
+    # Plot the histograms for the posteriors obtained by SBI for some products
+    # Posteriors are usually bi-modal if the review distributions are U-shaped (need to understand)
+    for product_number in [410, 576, 404]:
+        _ = sbi_utils.pairplot(posterior_samples[:, product_number, :], figsize=(10, 10))
 
 
 if __name__ == "__main__":
